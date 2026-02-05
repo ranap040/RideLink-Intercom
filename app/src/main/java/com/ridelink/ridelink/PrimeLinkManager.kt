@@ -115,6 +115,7 @@ class PrimeLinkManager(private val context: Context) {
 
     fun stopAll() {
         isRunning.set(false)
+        reconnectAttempts.set(MAX_RECONNECT_ATTEMPTS + 1)  // Prevent reconnection
         packetSequence.set(0)
         stopThreads()
         statusCallback?.invoke(Status.DISCONNECTED)

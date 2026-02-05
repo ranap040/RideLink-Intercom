@@ -18,21 +18,17 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
 /**
- * PHASE 5.3 FINAL: BLUETOOTH-OPTIMIZED AUDIO CORE
+ * PHASE 5.6 FINAL: TWS CRACKLE FIX
  *
- * CRITICAL FIXES:
- * 1. Start with 8kHz for maximum Bluetooth compatibility
- * 2. SCO activation BEFORE hardware initialization
- * 3. Only check TYPE_BLUETOOTH_SCO (not A2DP)
- * 4. Fixed CHUNK_SIZE for consistent timing
+ * KEY CHANGE: Larger AudioTrack buffer for Bluetooth (4x instead of 2x)
+ * This prevents Bluetooth SCO underruns that cause crackling
  */
 class AudioLoopback(private val context: Context) {
 
     private val TAG = "AudioLoopback"
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-    // FIX 1: Start with 8kHz for Bluetooth compatibility
-    private var sampleRate = 8000  // ← CHANGED from 16000
+    private val SAMPLE_RATE = 8000
     private val channelInConfig = AudioFormat.CHANNEL_IN_MONO
     private val channelOutConfig = AudioFormat.CHANNEL_OUT_MONO
     private val audioFormat = AudioFormat.ENCODING_PCM_16BIT
@@ -47,10 +43,10 @@ class AudioLoopback(private val context: Context) {
 
     @Volatile private var latestPeakAmplitude: Int = 0
     @Volatile private var underrunCount = 0
+    @Volatile private var capturePacketCount = 0
     private val hardwareLock = Any()
 
-    // FIX 2: Consistent 10ms chunks at 8kHz
-    private val CHUNK_SIZE = 80  // ← CHANGED from 160 (10ms at 8kHz)
+    private val CHUNK_SIZE = 80
     private val captureBuffer = ShortArray(CHUNK_SIZE)
     private val playbackBuffer = ShortArray(CHUNK_SIZE)
 
@@ -65,30 +61,27 @@ class AudioLoopback(private val context: Context) {
 
     fun getPeakAmplitude(): Int = latestPeakAmplitude
 
-    // FIX 3: Only check SCO (voice profile), not A2DP (music profile)
     private fun isBluetoothScoConnected(): Boolean {
         val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-        return devices.any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }  // ← REMOVED A2DP
+        return devices.any { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
     }
 
     private fun startBluetoothSco() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val commDevices = audioManager.availableCommunicationDevices
-            val scoDevice = commDevices.find {
-                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO  // ← ONLY SCO
-            }
+            val scoDevice = commDevices.find { it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO }
             scoDevice?.let {
                 val success = audioManager.setCommunicationDevice(it)
-                Log.d(TAG, "[BT] SCO routed to: ${it.productName} (success: $success)")
+                Log.d(TAG, "[BT] ✓ SCO routed to: ${it.productName} (success: $success)")
             } ?: run {
-                Log.w(TAG, "[BT] No SCO device found, trying legacy method")
                 audioManager.startBluetoothSco()
                 audioManager.isBluetoothScoOn = true
+                Log.d(TAG, "[BT] ✓ SCO started (fallback)")
             }
         } else {
             audioManager.startBluetoothSco()
             audioManager.isBluetoothScoOn = true
-            Log.d(TAG, "[BT] SCO started (legacy)")
+            Log.d(TAG, "[BT] ✓ SCO started (legacy)")
         }
     }
 
@@ -102,11 +95,19 @@ class AudioLoopback(private val context: Context) {
     }
 
     fun startLoopback(enableLocalLoop: Boolean = false): Boolean {
-        if (isRunning.get()) return false
+        if (isRunning.get()) {
+            Log.w(TAG, "[START] Already running, ignoring")
+            return false
+        }
+
+        Log.d(TAG, "═══════════════════════════════════════")
+        Log.d(TAG, "[START] Initializing Audio Core")
+        Log.d(TAG, "═══════════════════════════════════════")
 
         isRunning.set(true)
         reorderBuffer.clear()
         underrunCount = 0
+        capturePacketCount = 0
 
         captureThread = Thread {
             runCaptureEngine(enableLocalLoop)
@@ -127,38 +128,45 @@ class AudioLoopback(private val context: Context) {
         return true
     }
 
-    // FIX 4: SCO activation BEFORE hardware initialization
     private fun runCaptureEngine(enableLocalLoop: Boolean) {
         try {
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            Log.d(TAG, "[CAPTURE] Thread started")
 
-            // CRITICAL: Start SCO BEFORE creating hardware
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            Log.d(TAG, "[CAPTURE] Audio mode set to IN_COMMUNICATION")
+
             val isBluetooth = isBluetoothScoConnected()
             if (isBluetooth) {
+                Log.d(TAG, "[CAPTURE] Bluetooth SCO detected, activating...")
                 startBluetoothSco()
-                Thread.sleep(1500)  // ← INCREASED wait time for BT handshake
-                Log.d(TAG, "[BT] SCO established, now creating hardware...")
+                Thread.sleep(1500)
+                Log.d(TAG, "[CAPTURE] SCO link established")
+            } else {
+                Log.d(TAG, "[CAPTURE] No Bluetooth, using earpiece/speaker")
             }
 
-            // Now create hardware with correct sample rate
             synchronized(hardwareLock) {
-                if (!initAudioHardware(sampleRate)) {
-                    Log.e(TAG, "[INIT] Hardware initialization failed at ${sampleRate}Hz")
+                Log.d(TAG, "[CAPTURE] Initializing hardware at ${SAMPLE_RATE}Hz...")
+                if (!initAudioHardware(isBluetooth)) {
+                    Log.e(TAG, "[CAPTURE] ✗ CRITICAL: Hardware init failed!")
                     isRunning.set(false)
                     return
                 }
+                Log.d(TAG, "[CAPTURE] ✓ Hardware initialized")
+
                 attachAudioEffects()
                 audioRecord?.startRecording()
                 audioTrack?.play()
             }
 
-            Log.d(TAG, "[CAPTURE] Started at ${sampleRate}Hz, chunk=$CHUNK_SIZE samples (10ms)")
+            Log.d(TAG, "[CAPTURE] ✓✓✓ ACTIVE at ${SAMPLE_RATE}Hz, chunk=${CHUNK_SIZE} samples (10ms)")
 
             while (isRunning.get()) {
                 val read = audioRecord?.read(captureBuffer, 0, CHUNK_SIZE) ?: 0
 
                 if (read > 0) {
-                    // VU meter
+                    capturePacketCount++
+
                     var max = 0
                     for (i in 0 until read) {
                         val absVal = abs(captureBuffer[i].toInt())
@@ -166,21 +174,27 @@ class AudioLoopback(private val context: Context) {
                     }
                     latestPeakAmplitude = max
 
-                    // Convert to bytes
                     val payload = ByteBuffer.allocate(read * 2).order(ByteOrder.LITTLE_ENDIAN)
                     for (i in 0 until read) payload.putShort(captureBuffer[i])
 
-                    // Send to network
                     onAudioDataCaptured?.invoke(payload.array())
 
-                    // Local loopback (testing only)
+                    if (capturePacketCount % 100 == 0) {
+                        Log.d(TAG, "[CAPTURE] Sent $capturePacketCount packets (amplitude: $max)")
+                    }
+
                     if (enableLocalLoop) {
                         playRemoteAudio(System.currentTimeMillis(), payload.array())
                     }
+                } else if (read < 0) {
+                    Log.e(TAG, "[CAPTURE] AudioRecord error: $read")
                 }
             }
+
+            Log.d(TAG, "[CAPTURE] Loop ended normally (sent $capturePacketCount packets)")
+
         } catch (e: Exception) {
-            Log.e(TAG, "[CAPTURE] Error: ${e.message}")
+            Log.e(TAG, "[CAPTURE] ✗ Exception: ${e.message}", e)
         } finally {
             cleanupHardware()
         }
@@ -190,7 +204,7 @@ class AudioLoopback(private val context: Context) {
         val silenceBuffer = ShortArray(CHUNK_SIZE)
 
         try {
-            Log.d(TAG, "[PLAYBACK] Waiting for buffer prefill...")
+            Log.d(TAG, "[PLAYBACK] Thread started, waiting for prefill...")
 
             var waitCount = 0
             val maxWait = 150
@@ -200,17 +214,18 @@ class AudioLoopback(private val context: Context) {
                 waitCount++
 
                 if (waitCount % 25 == 0) {
-                    Log.d(TAG, "[PLAYBACK] Prefill waiting... ${reorderBuffer.getStats()}")
+                    Log.d(TAG, "[PLAYBACK] Prefill: ${reorderBuffer.getStats()}")
                 }
             }
 
-            if (!reorderBuffer.isReady()) {
-                Log.w(TAG, "[PLAYBACK] Prefill timeout, starting anyway")
+            if (reorderBuffer.isReady()) {
+                Log.d(TAG, "[PLAYBACK] ✓✓✓ READY: ${reorderBuffer.getStats()}")
             } else {
-                Log.d(TAG, "[PLAYBACK] Buffer ready: ${reorderBuffer.getStats()}")
+                Log.w(TAG, "[PLAYBACK] ⚠ Prefill timeout, starting anyway")
             }
 
             var consecutiveUnderruns = 0
+            var playbackPacketCount = 0
 
             while (isRunning.get()) {
                 val packet = reorderBuffer.take()
@@ -219,15 +234,12 @@ class AudioLoopback(private val context: Context) {
                     underrunCount++
                     consecutiveUnderruns++
 
-                    if (underrunCount % 10 == 0) {
-                        Log.w(TAG, "[PLAYBACK] Underrun #$underrunCount (consecutive: $consecutiveUnderruns) - ${reorderBuffer.getStats()}")
+                    if (underrunCount % 100 == 0) {
+                        Log.w(TAG, "[PLAYBACK] Underrun #$underrunCount - ${reorderBuffer.getStats()}")
                     }
 
                     synchronized(hardwareLock) {
-                        val track = audioTrack
-                        if (track != null && track.state == AudioTrack.STATE_INITIALIZED) {
-                            track.write(silenceBuffer, 0, CHUNK_SIZE)
-                        }
+                        audioTrack?.write(silenceBuffer, 0, CHUNK_SIZE)
                     }
 
                     Thread.sleep(5)
@@ -235,6 +247,7 @@ class AudioLoopback(private val context: Context) {
                 }
 
                 consecutiveUnderruns = 0
+                playbackPacketCount++
 
                 val copySize = minOf(packet.size, CHUNK_SIZE)
                 for (i in 0 until copySize) {
@@ -245,47 +258,51 @@ class AudioLoopback(private val context: Context) {
                 }
 
                 synchronized(hardwareLock) {
-                    val track = audioTrack
-                    if (track != null && track.state == AudioTrack.STATE_INITIALIZED) {
-                        track.write(playbackBuffer, 0, CHUNK_SIZE)
-                    }
+                    audioTrack?.write(playbackBuffer, 0, CHUNK_SIZE)
                 }
 
-                if (underrunCount > 0 && underrunCount % 50 == 0) {
-                    Log.d(TAG, "[PLAYBACK] Stats: ${reorderBuffer.getStats()}")
+                if (playbackPacketCount % 100 == 0) {
+                    Log.d(TAG, "[PLAYBACK] Played $playbackPacketCount packets - ${reorderBuffer.getStats()}")
                 }
             }
 
-            Log.d(TAG, "[PLAYBACK] Ended - Total underruns: $underrunCount")
+            Log.d(TAG, "[PLAYBACK] Ended (played $playbackPacketCount packets, underruns: $underrunCount)")
 
         } catch (e: InterruptedException) {
             Log.d(TAG, "[PLAYBACK] Interrupted (normal shutdown)")
         } catch (e: Exception) {
-            Log.e(TAG, "[PLAYBACK] Error: ${e.message}")
+            Log.e(TAG, "[PLAYBACK] ✗ Exception: ${e.message}", e)
         }
     }
 
-    private fun initAudioHardware(rate: Int): Boolean {
-        val minBufRecord = AudioRecord.getMinBufferSize(rate, channelInConfig, audioFormat)
+    // ═══════════════════════════════════════════════════════════════════════
+    // CRITICAL FIX FOR TWS CRACKLING
+    // ═══════════════════════════════════════════════════════════════════════
+    private fun initAudioHardware(isBluetoothSco: Boolean): Boolean {
+        val minBufRecord = AudioRecord.getMinBufferSize(SAMPLE_RATE, channelInConfig, audioFormat)
         if (minBufRecord <= 0) {
-            Log.e(TAG, "[INIT] Invalid buffer size for rate: $rate")
+            Log.e(TAG, "[INIT] ✗ ${SAMPLE_RATE}Hz not supported! (minBuf: $minBufRecord)")
             return false
         }
 
         try {
             audioRecord = AudioRecord(
                 MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                rate,
+                SAMPLE_RATE,
                 channelInConfig,
                 audioFormat,
                 minBufRecord * 2
             )
 
-            // Smaller buffers for Bluetooth (lower latency)
-            val trackBufferMultiplier = 2
-            val minBufTrack = AudioTrack.getMinBufferSize(rate, channelOutConfig, audioFormat)
+            val minBufTrack = AudioTrack.getMinBufferSize(SAMPLE_RATE, channelOutConfig, audioFormat)
 
-            Log.d(TAG, "[INIT] AudioTrack buffer: ${trackBufferMultiplier}x (${minBufTrack * trackBufferMultiplier} bytes)")
+            // ═══════════════════════════════════════════════════════════════
+            // FIX: Bluetooth needs LARGER buffer to prevent crackling
+            // ═══════════════════════════════════════════════════════════════
+            val trackBufferMultiplier = if (isBluetoothSco) 4 else 2  // ← CHANGED from 2
+
+            Log.d(TAG, "[INIT] Bluetooth: $isBluetoothSco, Buffer multiplier: ${trackBufferMultiplier}x")
+            Log.d(TAG, "[INIT] AudioTrack buffer size: ${minBufTrack * trackBufferMultiplier} bytes")
 
             audioTrack = AudioTrack.Builder()
                 .setAudioAttributes(
@@ -297,23 +314,23 @@ class AudioLoopback(private val context: Context) {
                 .setAudioFormat(
                     AudioFormat.Builder()
                         .setEncoding(audioFormat)
-                        .setSampleRate(rate)
+                        .setSampleRate(SAMPLE_RATE)
                         .setChannelMask(channelOutConfig)
                         .build()
                 )
-                .setBufferSizeInBytes(minBufTrack * trackBufferMultiplier)
+                .setBufferSizeInBytes(minBufTrack * trackBufferMultiplier)  // ← APPLIED HERE
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
 
             val recordOk = audioRecord?.state == AudioRecord.STATE_INITIALIZED
             val trackOk = audioTrack?.state == AudioTrack.STATE_INITIALIZED
 
-            Log.d(TAG, "[INIT] AudioRecord: $recordOk, AudioTrack: $trackOk")
+            Log.d(TAG, "[INIT] AudioRecord: ${if(recordOk) "✓" else "✗"}, AudioTrack: ${if(trackOk) "✓" else "✗"}")
 
             return recordOk && trackOk
 
         } catch (e: Exception) {
-            Log.e(TAG, "[INIT] Failed: ${e.message}")
+            Log.e(TAG, "[INIT] ✗ Exception: ${e.message}", e)
             return false
         }
     }
@@ -325,14 +342,14 @@ class AudioLoopback(private val context: Context) {
             if (AcousticEchoCanceler.isAvailable()) {
                 echoCanceler = AcousticEchoCanceler.create(sessionId)?.apply {
                     enabled = true
-                    Log.d(TAG, "[DSP] AEC enabled")
+                    Log.d(TAG, "[DSP] AEC ✓")
                 }
             }
 
             if (AutomaticGainControl.isAvailable()) {
                 gainControl = AutomaticGainControl.create(sessionId)?.apply {
                     enabled = true
-                    Log.d(TAG, "[DSP] AGC enabled")
+                    Log.d(TAG, "[DSP] AGC ✓")
                 }
             }
         } catch (e: Exception) {
@@ -343,6 +360,8 @@ class AudioLoopback(private val context: Context) {
     private fun cleanupHardware() {
         synchronized(hardwareLock) {
             try {
+                Log.d(TAG, "[CLEANUP] Releasing hardware...")
+
                 echoCanceler?.release()
                 echoCanceler = null
                 gainControl?.release()
@@ -365,7 +384,7 @@ class AudioLoopback(private val context: Context) {
 
                 audioManager.mode = AudioManager.MODE_NORMAL
 
-                Log.d(TAG, "[CLEANUP] Complete - Total underruns: $underrunCount")
+                Log.d(TAG, "[CLEANUP] ✓ Complete (packets: $capturePacketCount, underruns: $underrunCount)")
 
             } catch (e: Exception) {
                 Log.e(TAG, "[CLEANUP] Error: ${e.message}")
@@ -374,6 +393,7 @@ class AudioLoopback(private val context: Context) {
     }
 
     fun stopLoopback() {
+        Log.d(TAG, "[STOP] Stopping loopback")
         isRunning.set(false)
         captureThread?.interrupt()
         playbackThread?.interrupt()
